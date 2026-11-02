@@ -508,6 +508,10 @@ main {
     object-fit: contain;
 }
 
+.camera-view img[hidden] {
+    display: none;
+}
+
 .camera-view-label {
     position: absolute;
     top: 0.75rem;

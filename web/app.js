@@ -80,7 +80,7 @@ const pages = {
                         </div>
                         <div class="camera-view">
                             <span class="camera-view-label">Mask detection</span>
-                            <img id="detected-frame" alt="Latest annotated detection frame">
+                            <img id="detected-frame" alt="Latest annotated detection frame" hidden>
                             <div id="result-placeholder" class="camera-placeholder">
                                 <i class="fa-solid fa-person-circle-question"></i>
                                 <p>Detection results will appear here.</p>
@@ -96,6 +96,7 @@ const pages = {
                             <span id="status-text">Camera stopped</span>
                         </div>
                         <p id="detector-message" class="detector-message" role="status" aria-live="polite">Select Start Camera to begin.</p>
+                        <p id="last-detection-time" class="detector-message">No successful detections yet.</p>
                     </div>
                     
                     <div class="camera-actions">
@@ -168,8 +169,22 @@ let detectionTimer = null;
 let detectionAbortController = null;
 let detectionSession = 0;
 let detectionImageUrl = null;
-const MAX_FRAME_WIDTH = 640;
-const FRAME_INTERVAL_MS = 50;
+let detectionRetryCount = 0;
+let detectionInFlight = false;
+let detectionInFlightSession = null;
+const MAX_FRAME_WIDTH = 480;
+const DEFAULT_DETECTION_INTERVAL_MS = 1000;
+const MIN_DETECTION_INTERVAL_MS = 250;
+const MAX_DETECTION_INTERVAL_MS = 10000;
+const CAMERA_READY_CHECK_INTERVAL_MS = 100;
+const configuredDetectionInterval = Number(
+    new URLSearchParams(window.location.search).get('detectionIntervalMs')
+);
+const DETECTION_INTERVAL_MS = Number.isFinite(configuredDetectionInterval)
+    && configuredDetectionInterval >= MIN_DETECTION_INTERVAL_MS
+    ? Math.min(configuredDetectionInterval, MAX_DETECTION_INTERVAL_MS)
+    : DEFAULT_DETECTION_INTERVAL_MS;
+const MAX_DETECTION_RETRIES = 5;
 const captureCanvas = document.createElement('canvas');
 const captureContext = captureCanvas.getContext('2d', { alpha: false });
 
@@ -214,7 +229,10 @@ function stopCamera(showStatus = true) {
         detectionImageUrl = null;
     }
     const detectedFrame = document.getElementById('detected-frame');
-    if (detectedFrame) detectedFrame.removeAttribute('src');
+    if (detectedFrame) {
+        detectedFrame.removeAttribute('src');
+        detectedFrame.hidden = true;
+    }
     const resultPlaceholder = document.getElementById('result-placeholder');
     if (resultPlaceholder) resultPlaceholder.hidden = false;
 
@@ -239,24 +257,45 @@ function captureFrame(video) {
     captureCanvas.width = Math.round(video.videoWidth * scale);
     captureCanvas.height = Math.round(video.videoHeight * scale);
     captureContext.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-    return new Promise(resolve => captureCanvas.toBlob(resolve, 'image/jpeg', 0.7));
+    return new Promise(resolve => captureCanvas.toBlob(resolve, 'image/jpeg', 0.65));
 }
 
 async function detectFrames(session) {
     if (session !== detectionSession || !mediaStream) return;
-
-    const preview = document.getElementById('camera-preview');
-    if (!preview || preview.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        detectionTimer = window.setTimeout(() => detectFrames(session), FRAME_INTERVAL_MS);
+    if (detectionInFlight) {
+        if (session !== detectionInFlightSession) {
+            detectionTimer = window.setTimeout(
+                () => detectFrames(session),
+                CAMERA_READY_CHECK_INTERVAL_MS
+            );
+        }
         return;
     }
 
+    const preview = document.getElementById('camera-preview');
+    if (!preview || preview.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        detectionTimer = window.setTimeout(
+            () => detectFrames(session),
+            CAMERA_READY_CHECK_INTERVAL_MS
+        );
+        return;
+    }
+
+    detectionInFlight = true;
+    detectionInFlightSession = session;
     let requestController = null;
-    let retryDelay = FRAME_INTERVAL_MS;
+    let retryDelay = DETECTION_INTERVAL_MS;
+    let stopRetrying = false;
     try {
         const frame = await captureFrame(preview);
         if (!frame) throw new Error('Could not capture a camera frame.');
 
+        setDetectorStatus(
+            detectionImageUrl
+                ? 'Processing a new frame; showing the previous successful result.'
+                : 'Processing the first frame...',
+            true
+        );
         const formData = new FormData();
         formData.append('image', frame, 'frame.jpg');
         requestController = new AbortController();
@@ -269,28 +308,88 @@ async function detectFrames(session) {
 
         if (!response.ok) {
             const result = await response.json().catch(() => ({}));
-            throw new Error(result.error || `Detection request failed (${response.status}).`);
+            const error = new Error(result.error || `Detection request failed (${response.status}).`);
+            stopRetrying = response.status !== 429;
+            throw error;
+        }
+
+        const contentType = response.headers.get('Content-Type') || '';
+        if (!contentType.toLowerCase().startsWith('image/jpeg')) {
+            stopRetrying = true;
+            throw new Error('Detection service returned an unexpected image format.');
         }
 
         const resultBlob = await response.blob();
+        if (!resultBlob.size) {
+            stopRetrying = true;
+            throw new Error('Detection service returned an empty image.');
+        }
         if (session !== detectionSession) return;
 
-        if (detectionImageUrl) URL.revokeObjectURL(detectionImageUrl);
-        detectionImageUrl = URL.createObjectURL(resultBlob);
         const detectedFrame = document.getElementById('detected-frame');
         const resultPlaceholder = document.getElementById('result-placeholder');
-        if (detectedFrame) detectedFrame.src = detectionImageUrl;
+        if (!detectedFrame) {
+            stopRetrying = true;
+            throw new Error('Detection result panel is unavailable.');
+        }
+
+        const nextImageUrl = URL.createObjectURL(resultBlob);
+        const decodedImage = new Image();
+        decodedImage.src = nextImageUrl;
+        try {
+            await decodedImage.decode();
+        } catch (_error) {
+            URL.revokeObjectURL(nextImageUrl);
+            stopRetrying = true;
+            throw new Error('Detection service returned an invalid JPEG image.');
+        }
+        if (session !== detectionSession) {
+            URL.revokeObjectURL(nextImageUrl);
+            return;
+        }
+
+        const previousImageUrl = detectionImageUrl;
+        detectedFrame.src = nextImageUrl;
+        detectedFrame.hidden = false;
+        detectionImageUrl = nextImageUrl;
         if (resultPlaceholder) resultPlaceholder.hidden = true;
-        setDetectorStatus('Camera active. Detection is running.', true);
+        if (previousImageUrl) URL.revokeObjectURL(previousImageUrl);
+        detectionRetryCount = 0;
+        const detectedAt = new Date();
+        const lastDetectionTime = document.getElementById('last-detection-time');
+        if (lastDetectionTime) {
+            lastDetectionTime.textContent = `Last detection: ${detectedAt.toLocaleTimeString()}`;
+        }
+        setDetectorStatus(
+            `Detection updated at ${detectedAt.toLocaleTimeString()}.`,
+            true
+        );
     } catch (error) {
         if (error.name === 'AbortError' || session !== detectionSession) return;
-        setDetectorStatus(`Detection service error: ${error.message} Retrying...`, true);
-        retryDelay = 500;
+        detectionRetryCount += 1;
+        if (stopRetrying || detectionRetryCount >= MAX_DETECTION_RETRIES) {
+            setDetectorStatus(
+                `Detection stopped: ${error.message} Stop and restart the camera to try again.`,
+                true
+            );
+            stopRetrying = true;
+        } else {
+            setDetectorStatus(
+                `Detection service error: ${error.message} Retrying (${detectionRetryCount}/${MAX_DETECTION_RETRIES})...`,
+                true
+            );
+            retryDelay = Math.min(
+                DETECTION_INTERVAL_MS * (2 ** (detectionRetryCount - 1)),
+                MAX_DETECTION_INTERVAL_MS
+            );
+        }
     } finally {
         if (detectionAbortController === requestController) detectionAbortController = null;
+        detectionInFlight = false;
+        detectionInFlightSession = null;
     }
 
-    if (session === detectionSession && mediaStream) {
+    if (!stopRetrying && session === detectionSession && mediaStream) {
         detectionTimer = window.setTimeout(() => detectFrames(session), retryDelay);
     }
 }
@@ -312,8 +411,8 @@ async function startCamera() {
         const stream = await navigator.mediaDevices.getUserMedia({
             video: {
                 facingMode: { ideal: 'user' },
-                width: { ideal: MAX_FRAME_WIDTH },
-                frameRate: { ideal: 24, max: 30 }
+                width: { ideal: MAX_FRAME_WIDTH, max: MAX_FRAME_WIDTH },
+                frameRate: { ideal: 15, max: 15 }
             },
             audio: false
         });
@@ -329,6 +428,7 @@ async function startCamera() {
         await preview.play();
         const cameraPlaceholder = document.getElementById('camera-placeholder');
         if (cameraPlaceholder) cameraPlaceholder.hidden = true;
+        detectionRetryCount = 0;
         if (stopButton) stopButton.disabled = false;
         setDetectorStatus('Camera active. Waiting for the first detection...', true);
         detectFrames(session);
