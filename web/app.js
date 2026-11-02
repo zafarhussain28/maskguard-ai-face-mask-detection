@@ -22,7 +22,7 @@ const pages = {
                 </div>
                 <div class="hero-image-container">
                     <div class="glass-frame">
-                        <img src="assets/hero.png" alt="Mask Detection AI" class="hero-img">
+                        <img src="/static/assets/hero.png" alt="Mask Detection AI" class="hero-img">
                         <div class="glow-effect"></div>
                     </div>
                 </div>
@@ -64,33 +64,46 @@ const pages = {
         <div class="page-section" style="padding-top: 2rem;">
             <div class="section-header">
                 <h2>Live <span class="text-gradient-brand">Detection</span></h2>
-                <p>Ensuring real-time safety through intelligent visual monitoring. The stream below is processed via our Flask backend.</p>
+                <p>Camera frames are processed securely by the MaskGuard detection service.</p>
             </div>
             
             <div class="detector-container">
                 <div class="video-frame">
-                    <img id="video-stream" src="http://localhost:5000/video_feed" 
-                         alt="Camera Feed" 
-                         style="width: 100%; height: 100%; object-fit: cover; display: none;"
-                         onload="this.style.display='block'; document.getElementById('placeholder').style.display='none'; document.getElementById('system-status').classList.add('active'); document.getElementById('status-text').textContent='System Active';"
-                         onerror="this.style.display='none'; document.getElementById('placeholder').style.display='flex'; document.getElementById('system-status').classList.remove('active'); document.getElementById('status-text').textContent='System Offline';">
-                    
-                    <div id="placeholder" class="video-placeholder">
-                        <i class="fa-solid fa-video-slash"></i>
-                        <p>Camera feed offline.</p>
-                        <p style="font-size: 0.9rem; opacity: 0.7; margin-top: 10px;">Please ensure 'python src/web_server.py' is running.</p>
+                    <div class="camera-stage">
+                        <div class="camera-view">
+                            <span class="camera-view-label">Live camera</span>
+                            <video id="camera-preview" autoplay muted playsinline></video>
+                            <div id="camera-placeholder" class="camera-placeholder">
+                                <i class="fa-solid fa-video-slash"></i>
+                                <p>Camera is stopped.</p>
+                            </div>
+                        </div>
+                        <div class="camera-view">
+                            <span class="camera-view-label">Mask detection</span>
+                            <img id="detected-frame" alt="Latest annotated detection frame">
+                            <div id="result-placeholder" class="camera-placeholder">
+                                <i class="fa-solid fa-person-circle-question"></i>
+                                <p>Detection results will appear here.</p>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 
-                <div class="controls">
-                    <div class="status-indicator">
-                        <div class="dot" id="system-status"></div>
-                        <span id="status-text">Checking System...</span>
+                <div class="controls detector-controls">
+                    <div class="detector-status-group">
+                        <div class="status-indicator">
+                            <div class="dot" id="system-status"></div>
+                            <span id="status-text">Camera stopped</span>
+                        </div>
+                        <p id="detector-message" class="detector-message" role="status" aria-live="polite">Select Start Camera to begin.</p>
                     </div>
                     
-                    <div style="display: flex; gap: 1rem;">
-                        <button class="btn btn-primary" onclick="window.location.reload()">
-                            <i class="fa-solid fa-arrows-rotate"></i> Refresh Stream
+                    <div class="camera-actions">
+                        <button class="btn btn-primary" id="start-camera" type="button">
+                            <i class="fa-solid fa-play"></i> Start Camera
+                        </button>
+                        <button class="btn btn-secondary" id="stop-camera" type="button" disabled>
+                            <i class="fa-solid fa-stop"></i> Stop Camera
                         </button>
                     </div>
                 </div>
@@ -150,6 +163,183 @@ const pages = {
 // Routing Logic
 const contentDiv = document.getElementById('main-content');
 const navLinks = document.querySelectorAll('.nav-link');
+let mediaStream = null;
+let detectionTimer = null;
+let detectionAbortController = null;
+let detectionSession = 0;
+let detectionImageUrl = null;
+const MAX_FRAME_WIDTH = 640;
+const FRAME_INTERVAL_MS = 50;
+const captureCanvas = document.createElement('canvas');
+const captureContext = captureCanvas.getContext('2d', { alpha: false });
+
+function setDetectorStatus(message, active = false) {
+    const statusText = document.getElementById('status-text');
+    const detectorMessage = document.getElementById('detector-message');
+    const statusDot = document.getElementById('system-status');
+
+    if (statusText) statusText.textContent = active ? 'Camera active' : 'Camera stopped';
+    if (detectorMessage) detectorMessage.textContent = message;
+    if (statusDot) statusDot.classList.toggle('active', active);
+}
+
+function stopCamera(showStatus = true) {
+    detectionSession += 1;
+    window.clearTimeout(detectionTimer);
+    detectionTimer = null;
+    if (detectionAbortController) detectionAbortController.abort();
+    detectionAbortController = null;
+
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
+
+    const preview = document.getElementById('camera-preview');
+    if (preview) {
+        preview.pause();
+        preview.srcObject = null;
+    }
+
+    const cameraPlaceholder = document.getElementById('camera-placeholder');
+    if (cameraPlaceholder) cameraPlaceholder.hidden = false;
+
+    const startButton = document.getElementById('start-camera');
+    const stopButton = document.getElementById('stop-camera');
+    if (startButton) startButton.disabled = false;
+    if (stopButton) stopButton.disabled = true;
+
+    if (detectionImageUrl) {
+        URL.revokeObjectURL(detectionImageUrl);
+        detectionImageUrl = null;
+    }
+    const detectedFrame = document.getElementById('detected-frame');
+    if (detectedFrame) detectedFrame.removeAttribute('src');
+    const resultPlaceholder = document.getElementById('result-placeholder');
+    if (resultPlaceholder) resultPlaceholder.hidden = false;
+
+    if (showStatus) setDetectorStatus('Camera stopped. Select Start Camera when you are ready.');
+}
+
+function cameraErrorMessage(error) {
+    if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+        return 'Camera permission was denied. Allow camera access in your browser settings, then try again.';
+    }
+    if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+        return 'No camera was found. Connect a camera and try again.';
+    }
+    if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+        return 'The camera is unavailable or already in use by another application.';
+    }
+    return 'Could not start the camera. Check your browser and camera settings, then try again.';
+}
+
+function captureFrame(video) {
+    const scale = Math.min(1, MAX_FRAME_WIDTH / video.videoWidth);
+    captureCanvas.width = Math.round(video.videoWidth * scale);
+    captureCanvas.height = Math.round(video.videoHeight * scale);
+    captureContext.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+    return new Promise(resolve => captureCanvas.toBlob(resolve, 'image/jpeg', 0.7));
+}
+
+async function detectFrames(session) {
+    if (session !== detectionSession || !mediaStream) return;
+
+    const preview = document.getElementById('camera-preview');
+    if (!preview || preview.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        detectionTimer = window.setTimeout(() => detectFrames(session), FRAME_INTERVAL_MS);
+        return;
+    }
+
+    let requestController = null;
+    let retryDelay = FRAME_INTERVAL_MS;
+    try {
+        const frame = await captureFrame(preview);
+        if (!frame) throw new Error('Could not capture a camera frame.');
+
+        const formData = new FormData();
+        formData.append('image', frame, 'frame.jpg');
+        requestController = new AbortController();
+        detectionAbortController = requestController;
+        const response = await fetch('/api/detect', {
+            method: 'POST',
+            body: formData,
+            signal: requestController.signal
+        });
+
+        if (!response.ok) {
+            const result = await response.json().catch(() => ({}));
+            throw new Error(result.error || `Detection request failed (${response.status}).`);
+        }
+
+        const resultBlob = await response.blob();
+        if (session !== detectionSession) return;
+
+        if (detectionImageUrl) URL.revokeObjectURL(detectionImageUrl);
+        detectionImageUrl = URL.createObjectURL(resultBlob);
+        const detectedFrame = document.getElementById('detected-frame');
+        const resultPlaceholder = document.getElementById('result-placeholder');
+        if (detectedFrame) detectedFrame.src = detectionImageUrl;
+        if (resultPlaceholder) resultPlaceholder.hidden = true;
+        setDetectorStatus('Camera active. Detection is running.', true);
+    } catch (error) {
+        if (error.name === 'AbortError' || session !== detectionSession) return;
+        setDetectorStatus(`Detection service error: ${error.message} Retrying...`, true);
+        retryDelay = 500;
+    } finally {
+        if (detectionAbortController === requestController) detectionAbortController = null;
+    }
+
+    if (session === detectionSession && mediaStream) {
+        detectionTimer = window.setTimeout(() => detectFrames(session), retryDelay);
+    }
+}
+
+async function startCamera() {
+    if (mediaStream) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setDetectorStatus('Camera access requires a supported browser and a secure HTTPS connection.');
+        return;
+    }
+
+    const startButton = document.getElementById('start-camera');
+    const stopButton = document.getElementById('stop-camera');
+    if (startButton) startButton.disabled = true;
+    setDetectorStatus('Requesting camera permission...');
+
+    const session = ++detectionSession;
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: { ideal: 'user' },
+                width: { ideal: MAX_FRAME_WIDTH },
+                frameRate: { ideal: 24, max: 30 }
+            },
+            audio: false
+        });
+
+        if (session !== detectionSession || !document.getElementById('camera-preview')) {
+            stream.getTracks().forEach(track => track.stop());
+            return;
+        }
+
+        mediaStream = stream;
+        const preview = document.getElementById('camera-preview');
+        preview.srcObject = stream;
+        await preview.play();
+        const cameraPlaceholder = document.getElementById('camera-placeholder');
+        if (cameraPlaceholder) cameraPlaceholder.hidden = true;
+        if (stopButton) stopButton.disabled = false;
+        setDetectorStatus('Camera active. Waiting for the first detection...', true);
+        detectFrames(session);
+    } catch (error) {
+        if (session !== detectionSession) return;
+        stopCamera(false);
+        if (startButton) startButton.disabled = false;
+        if (stopButton) stopButton.disabled = true;
+        setDetectorStatus(cameraErrorMessage(error));
+    }
+}
 
 function navigateTo(pageId) {
     // Default to home if invalid
@@ -157,8 +347,17 @@ function navigateTo(pageId) {
         pageId = 'home';
     }
 
+    if (pageId !== 'detector' && document.getElementById('camera-preview')) {
+        stopCamera(false);
+    }
+
     // Update Content
     contentDiv.innerHTML = pages[pageId];
+
+    const startButton = document.getElementById('start-camera');
+    const stopButton = document.getElementById('stop-camera');
+    if (startButton) startButton.addEventListener('click', startCamera);
+    if (stopButton) stopButton.addEventListener('click', () => stopCamera());
 
     // Update Active Nav Style
     navLinks.forEach(link => {

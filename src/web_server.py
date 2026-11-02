@@ -2,37 +2,59 @@ import os
 import cv2
 import numpy as np
 import threading
-from flask import Flask, render_template, Response
+import tensorflow as tf
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for the frontend to access the stream
-
 # --- Configuration & Paths ---
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+WEB_ROOT = os.path.join(PROJECT_ROOT, "web")
 MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "mask_detector.keras")
 PROTOTXT_PATH = os.path.join(PROJECT_ROOT, "deploy.prototxt")
 CAFFEMODEL_PATH = os.path.join(PROJECT_ROOT, "res10_300x300_ssd_iter_140000.caffemodel")
+MAX_IMAGE_SIZE = 8 * 1024 * 1024
+
+app = Flask(__name__, static_folder=WEB_ROOT, static_url_path="/static")
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE
+CORS(app)
 
 IMG_SIZE = 224
 FACE_CONF_THR = 0.5
 MASK_CONF_THR = 0.5
 
-# Global Resources
+# Model resources are initialized at import time for Gunicorn workers.
 mask_model = None
+mask_model_inference = None
 face_net = None
-video_capture = None
-current_frame = None
-lock = threading.Lock()
-is_running = True
+model_status = {"mask_classifier": False, "face_detector": False}
+inference_lock = threading.Lock()
 
 def load_resources():
-    global mask_model, face_net
-    print("[INFO] Loading models...")
-    mask_model = load_model(MODEL_PATH)
-    face_net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, CAFFEMODEL_PATH)
-    print("[SUCCESS] Models loaded.")
+    global mask_model, mask_model_inference, face_net
+    try:
+        mask_model = load_model(MODEL_PATH)
+        mask_model_inference = tf.function(
+            classify_face,
+            input_signature=[
+                tf.TensorSpec((1, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32)
+            ],
+        )
+        mask_model_inference(tf.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32))
+        model_status["mask_classifier"] = True
+    except Exception:
+        mask_model = None
+        mask_model_inference = None
+        app.logger.exception("Failed to load the mask classifier")
+
+    try:
+        face_net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, CAFFEMODEL_PATH)
+        model_status["face_detector"] = True
+    except Exception:
+        app.logger.exception("Failed to load the face detector")
+
+def classify_face(face):
+    return mask_model(face, training=False)
 
 def detect_and_predict(frame):
     if frame is None: return None
@@ -59,7 +81,7 @@ def detect_and_predict(frame):
         face = face.astype("float32") / 255.0
         face = np.expand_dims(face, axis=0)
 
-        prediction = mask_model.predict(face, verbose=0)[0][0]
+        prediction = float(mask_model_inference(face)[0, 0].numpy())
         
         if prediction < MASK_CONF_THR:
             label, color = "Mask", (0, 255, 0)
@@ -74,68 +96,61 @@ def detect_and_predict(frame):
     
     return frame
 
-def camera_thread_func():
-    global video_capture, current_frame, is_running
-    print("[INFO] Starting background camera thread...")
-    video_capture = cv2.VideoCapture(0)
-    
-    if not video_capture.isOpened():
-        print("[ERROR] Could not open webcam. Ensure it's not used by other apps.")
-        is_running = False
-        return
-
-    print("[SUCCESS] Webcam initialized in background.")
-    
-    while is_running:
-        success, frame = video_capture.read()
-        if not success:
-            print("[WARNING] Could not read from webcam.")
-            break
-        
-        # Process frame
-        processed_frame = detect_and_predict(frame)
-        
-        # Encode
-        _, buffer = cv2.imencode('.jpg', processed_frame)
-        
-        with lock:
-            current_frame = buffer.tobytes()
-
-    video_capture.release()
-    print("[INFO] Camera thread stopped.")
-
-def generate_frames():
-    while is_running:
-        with lock:
-            if current_frame is None:
-                continue
-            frame_bytes = current_frame
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
-        # Slow down the generator to match frame rate and reduce CPU load
-        import time
-        time.sleep(0.03)
-
-@app.route('/video_feed')
-def video_feed():
-    if not is_running:
-        return "Camera initialization failed", 500
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/')
+@app.get("/")
 def index():
-    print("[INFO] Health check hit on root.")
-    return "MaskGuard AI Streaming Server Active"
+    return send_from_directory(WEB_ROOT, "index.html")
+
+@app.get("/health")
+def health():
+    ready = all(model_status.values())
+    return jsonify({
+        "status": "ok" if ready else "degraded",
+        "application": "ready",
+        "models": model_status,
+    }), 200 if ready else 503
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"error": "Image exceeds the 8 MB upload limit."}), 413
+
+@app.post("/api/detect")
+def detect_image():
+    if request.mimetype != "multipart/form-data":
+        return jsonify({"error": "Upload an image using multipart/form-data."}), 400
+
+    uploaded_file = request.files.get("image")
+    if uploaded_file is None:
+        return jsonify({"error": "Missing image file. Add it under the 'image' field."}), 400
+
+    image_bytes = uploaded_file.read()
+    if not image_bytes:
+        return jsonify({"error": "The uploaded image is empty."}), 400
+
+    try:
+        frame = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except cv2.error:
+        frame = None
+    if frame is None:
+        return jsonify({"error": "The uploaded file is not a valid image."}), 400
+
+    if not all(model_status.values()):
+        return jsonify({"error": "Detection models are unavailable."}), 503
+
+    try:
+        with inference_lock:
+            annotated_frame = detect_and_predict(frame)
+        success, encoded_image = cv2.imencode(
+            ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+        )
+        if not success:
+            raise RuntimeError("JPEG encoding failed")
+    except Exception:
+        app.logger.exception("Image detection failed")
+        return jsonify({"error": "Image processing failed."}), 500
+
+    return app.response_class(encoded_image.tobytes(), mimetype="image/jpeg")
+
+load_resources()
 
 if __name__ == "__main__":
-    load_resources()
-    
-    # Start background thread
-    t = threading.Thread(target=camera_thread_func)
-    t.daemon = True
-    t.start()
-    
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

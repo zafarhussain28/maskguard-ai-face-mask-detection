@@ -483,6 +483,91 @@ main {
     opacity: 0.5;
 }
 
+.camera-stage {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    height: 100%;
+    gap: 1px;
+    background: var(--glass-border);
+}
+
+.camera-view {
+    position: relative;
+    min-width: 0;
+    overflow: hidden;
+    background: #08090d;
+}
+
+.camera-view video,
+.camera-view img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.camera-view-label {
+    position: absolute;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: 2;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    background: rgba(15, 17, 26, 0.75);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    font-weight: 600;
+}
+
+.camera-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 1rem;
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+.camera-placeholder[hidden] {
+    display: none;
+}
+
+.camera-placeholder i {
+    font-size: 2rem;
+    opacity: 0.65;
+}
+
+.detector-status-group {
+    min-width: 0;
+}
+
+.detector-message {
+    max-width: 560px;
+    margin-top: 0.4rem;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    overflow-wrap: anywhere;
+}
+
+.camera-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.camera-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    transform: none;
+}
+
 .controls {
     display: flex;
     justify-content: space-between;
@@ -616,5 +701,26 @@ footer {
     .controls {
         flex-direction: column;
         gap: 1.5rem;
+    }
+
+    .video-frame {
+        height: auto;
+        aspect-ratio: auto;
+    }
+
+    .camera-stage {
+        grid-template-columns: 1fr;
+    }
+
+    .camera-view {
+        aspect-ratio: 16 / 9;
+    }
+
+    .camera-actions {
+        width: 100%;
+    }
+
+    .camera-actions button {
+        flex: 1;
     }
 }

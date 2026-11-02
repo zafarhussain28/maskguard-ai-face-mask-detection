@@ -1,16 +1,6 @@
-from flask import Flask
-from flask_cors import CORS
+import os
 
-app = Flask(__name__)
-CORS(app)
-
-@app.route('/')
-def hello():
-    return "Mini Server Active"
-
-@app.route('/test')
-def test():
-    return "Test Success"
+from src.web_server import app
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
