@@ -20,12 +20,21 @@ pip install -r requirements.txt
 ### 2. Choose Your Interface
 
 #### Option A: Web Dashboard (Recommended)
-This launches a modern web interface with a live stream.
+The Flask application serves the dashboard and processes browser camera frames.
+Camera access requires HTTPS when deployed.
+
 1. Start the backend:
    ```bash
    python src/web_server.py
    ```
-2. Open `web/index.html` in your browser.
+2. Open `http://127.0.0.1:5000` in your browser and select **Start Camera**.
+
+For production, run Gunicorn from the project root:
+```bash
+gunicorn --chdir src web_server:app
+```
+The application serves its frontend and `/api/detect` endpoint from the same origin.
+The native desktop script below is separate and is not used by the web deployment.
 
 #### Option B: Native Desktop Window
 A lightweight script that opens a dedicated OpenCV window.
