@@ -500,7 +500,8 @@ main {
 }
 
 .camera-view video,
-.camera-view img {
+.camera-view img,
+.camera-view canvas {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -510,6 +511,15 @@ main {
 
 .camera-view img[hidden] {
     display: none;
+}
+
+.camera-view canvas[hidden] {
+    display: none;
+}
+
+.camera-view .detection-overlay {
+    z-index: 1;
+    pointer-events: none;
 }
 
 .camera-view-label {
@@ -557,6 +567,50 @@ main {
     color: var(--text-secondary);
     font-size: 0.9rem;
     overflow-wrap: anywhere;
+}
+
+.inference-diagnostics {
+    max-width: 560px;
+    margin-top: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+.inference-diagnostics summary {
+    width: fit-content;
+    cursor: pointer;
+    color: var(--text-secondary);
+}
+
+.inference-diagnostics dl {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem 1rem;
+    margin-top: 0.65rem;
+}
+
+.inference-diagnostics dl div {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.inference-diagnostics dt,
+.inference-diagnostics dd {
+    margin: 0;
+}
+
+.inference-diagnostics dd {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.crop-fixture-button {
+    margin-top: 0.75rem;
+}
+
+.crop-fixture-button[hidden] {
+    display: none;
 }
 
 .camera-actions {

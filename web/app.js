@@ -64,7 +64,7 @@ const pages = {
         <div class="page-section" style="padding-top: 2rem;">
             <div class="section-header">
                 <h2>Live <span class="text-gradient-brand">Detection</span></h2>
-                <p>Camera frames are processed securely by the MaskGuard detection service.</p>
+                <p>Face detection and mask classification run locally in your browser. Camera frames are not sent to the server.</p>
             </div>
             
             <div class="detector-container">
@@ -73,17 +73,18 @@ const pages = {
                         <div class="camera-view">
                             <span class="camera-view-label">Live camera</span>
                             <video id="camera-preview" autoplay muted playsinline></video>
+                            <canvas id="detection-overlay" class="detection-overlay" aria-hidden="true"></canvas>
                             <div id="camera-placeholder" class="camera-placeholder">
                                 <i class="fa-solid fa-video-slash"></i>
                                 <p>Camera is stopped.</p>
                             </div>
                         </div>
                         <div class="camera-view">
-                            <span class="camera-view-label">Mask detection</span>
-                            <img id="detected-frame" alt="Latest annotated detection frame" hidden>
+                            <span class="camera-view-label">Local detection result</span>
+                            <canvas id="detected-frame" class="detection-result-canvas" role="img" aria-label="Latest locally annotated detection frame" hidden></canvas>
                             <div id="result-placeholder" class="camera-placeholder">
                                 <i class="fa-solid fa-person-circle-question"></i>
-                                <p>Detection results will appear here.</p>
+                                <p>Local detection results will appear here.</p>
                             </div>
                         </div>
                     </div>
@@ -97,6 +98,30 @@ const pages = {
                         </div>
                         <p id="detector-message" class="detector-message" role="status" aria-live="polite">Select Start Camera to begin.</p>
                         <p id="last-detection-time" class="detector-message">No successful detections yet.</p>
+                        <p class="detector-message mapping-notice">Mask labels use the existing provisional class mapping; training class indices have not been verified.</p>
+                        <details id="inference-diagnostics" class="inference-diagnostics" hidden>
+                            <summary>Development inference diagnostics</summary>
+                            <dl>
+                                <div><dt>Faces detected / classified</dt><dd id="diagnostic-face-count">—</dd></div>
+                                <div><dt>Face boxes (x, y, w, h)</dt><dd id="diagnostic-face-boxes">—</dd></div>
+                                <div><dt>Face detection</dt><dd id="diagnostic-detection-ms">—</dd></div>
+                                <div><dt>Face crop / resize</dt><dd id="diagnostic-crop-resize-ms">—</dd></div>
+                                <div><dt>RGBA pixel readback</dt><dd id="diagnostic-pixel-read-ms">—</dd></div>
+                                <div><dt>RGB conversion / normalization</dt><dd id="diagnostic-normalize-ms">—</dd></div>
+                                <div><dt>Tensor creation</dt><dd id="diagnostic-tensor-create-ms">—</dd></div>
+                                <div><dt>Graph execution</dt><dd id="diagnostic-graph-ms">—</dd></div>
+                                <div><dt>Output readback</dt><dd id="diagnostic-output-ms">—</dd></div>
+                                <div><dt>Tensor disposal</dt><dd id="diagnostic-dispose-ms">—</dd></div>
+                                <div><dt>Classifier total</dt><dd id="diagnostic-classifier-ms">—</dd></div>
+                                <div><dt>Total frame processing</dt><dd id="diagnostic-frame-ms">—</dd></div>
+                                <div><dt>Processing rate</dt><dd id="diagnostic-fps">—</dd></div>
+                                <div><dt>Backend / initialization</dt><dd id="diagnostic-backend">—</dd></div>
+                                <div><dt>Tensor count / bytes</dt><dd id="diagnostic-tensor-memory">—</dd></div>
+                            </dl>
+                        </details>
+                        <button id="export-face-crop" class="btn btn-secondary crop-fixture-button" type="button" disabled hidden>
+                            Export first face crop (PNG)
+                        </button>
                     </div>
                     
                     <div class="camera-actions">
@@ -150,9 +175,10 @@ const pages = {
                 <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">The system is divided into two primary inference stages:</p>
                 
                 <ol style="color: var(--text-secondary); margin-left: 1.5rem; margin-bottom: 2rem; display: flex; flex-direction: column; gap: 1rem;">
-                    <li><strong>Face Detection:</strong> We leverage OpenCV's deep learning-based face detector (Single Shot Detector with ResNet-10 backbone) via the <code>deploy.prototxt</code> and Caffe model. This accurately segments faces from the frame irrespective of angle or lighting.</li>
-                    <li><strong>Mask Classification:</strong> The localized face Region of Interest (ROI) is passed to a custom fine-tuned MobileNetV2 network. MobileNetV2 uses lightweight depthwise separable convolutions, making it ideal for high-framerate real-time processing while extracting complex spatial features.</li>
+                    <li><strong>Browser face detection:</strong> Live prototype detection uses MediaPipe's short-range face detector locally in the browser. The Flask API remains available and retains its OpenCV SSD detector.</li>
+                    <li><strong>Mask classification:</strong> Face crops are classified locally with the existing MobileNetV2 TensorFlow.js GraphModel. The original Keras model and Flask endpoint remain unchanged.</li>
                 </ol>
+                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">The current mask/no-mask class mapping is provisional because the training class-index metadata is not available in this workspace.</p>
 
                 <h3 style="margin-bottom: 1rem;">Model Training</h3>
                 <p style="color: var(--text-secondary);">The classifier was trained using a standard dataset of faces with and without masks, utilizing extreme image augmentation (rotation, zooming, shifts, shearing) to combat overfitting and improve generalization on novel faces.</p>
@@ -166,27 +192,21 @@ const contentDiv = document.getElementById('main-content');
 const navLinks = document.querySelectorAll('.nav-link');
 let mediaStream = null;
 let detectionTimer = null;
-let detectionAbortController = null;
 let detectionSession = 0;
-let detectionImageUrl = null;
-let detectionRetryCount = 0;
-let detectionInFlight = false;
-let detectionInFlightSession = null;
+let inferenceWorker = null;
+let inferenceWorkerReadyReject = null;
+let inferenceInFlight = false;
+let inferenceFrameCallbackId = null;
+let inferenceFailed = false;
+let inferenceCompletionTimes = [];
+let diagnosticCropFixture = null;
 const MAX_FRAME_WIDTH = 480;
-const DEFAULT_DETECTION_INTERVAL_MS = 1000;
-const MIN_DETECTION_INTERVAL_MS = 250;
-const MAX_DETECTION_INTERVAL_MS = 10000;
 const CAMERA_READY_CHECK_INTERVAL_MS = 100;
-const configuredDetectionInterval = Number(
-    new URLSearchParams(window.location.search).get('detectionIntervalMs')
-);
-const DETECTION_INTERVAL_MS = Number.isFinite(configuredDetectionInterval)
-    && configuredDetectionInterval >= MIN_DETECTION_INTERVAL_MS
-    ? Math.min(configuredDetectionInterval, MAX_DETECTION_INTERVAL_MS)
-    : DEFAULT_DETECTION_INTERVAL_MS;
-const MAX_DETECTION_RETRIES = 5;
-const captureCanvas = document.createElement('canvas');
-const captureContext = captureCanvas.getContext('2d', { alpha: false });
+const pageOptions = new URLSearchParams(window.location.search);
+const MODEL_OUTPUT_MEANS_MASK = pageOptions.get('maskProbabilityMeansMask') !== 'false';
+const DEVELOPMENT_DIAGNOSTICS_ENABLED = pageOptions.get('diagnostics') === '1';
+const CAPTURE_FIRST_FACE_CROP = DEVELOPMENT_DIAGNOSTICS_ENABLED
+    && pageOptions.get('captureCrop') === '1';
 
 function setDetectorStatus(message, active = false) {
     const statusText = document.getElementById('status-text');
@@ -198,12 +218,52 @@ function setDetectorStatus(message, active = false) {
     if (statusDot) statusDot.classList.toggle('active', active);
 }
 
-function stopCamera(showStatus = true) {
-    detectionSession += 1;
+function stopInferenceLoop() {
     window.clearTimeout(detectionTimer);
     detectionTimer = null;
-    if (detectionAbortController) detectionAbortController.abort();
-    detectionAbortController = null;
+    const preview = document.getElementById('camera-preview');
+    if (preview && inferenceFrameCallbackId !== null
+        && typeof preview.cancelVideoFrameCallback === 'function') {
+        preview.cancelVideoFrameCallback(inferenceFrameCallbackId);
+    }
+    inferenceFrameCallbackId = null;
+}
+
+function clearDetectionCanvases() {
+    for (const canvasId of ['detection-overlay', 'detected-frame']) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) continue;
+        const context = canvas.getContext('2d');
+        if (context) context.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.width = 0;
+        canvas.height = 0;
+    }
+    const detectedFrame = document.getElementById('detected-frame');
+    if (detectedFrame) detectedFrame.hidden = true;
+    const resultPlaceholder = document.getElementById('result-placeholder');
+    if (resultPlaceholder) resultPlaceholder.hidden = false;
+}
+
+function disposeInferenceWorker() {
+    if (!inferenceWorker) return;
+    inferenceWorker.postMessage({ type: 'dispose' });
+    const workerToStop = inferenceWorker;
+    inferenceWorker = null;
+    window.setTimeout(() => workerToStop.terminate(), 250);
+}
+
+function stopCamera(showStatus = true) {
+    detectionSession += 1;
+    stopInferenceLoop();
+    if (inferenceWorkerReadyReject) {
+        inferenceWorkerReadyReject(new Error('Camera startup was cancelled.'));
+        inferenceWorkerReadyReject = null;
+    }
+    disposeInferenceWorker();
+    inferenceInFlight = false;
+    inferenceFailed = false;
+    inferenceCompletionTimes = [];
+    diagnosticCropFixture = null;
 
     if (mediaStream) {
         mediaStream.getTracks().forEach(track => track.stop());
@@ -223,18 +283,10 @@ function stopCamera(showStatus = true) {
     const stopButton = document.getElementById('stop-camera');
     if (startButton) startButton.disabled = false;
     if (stopButton) stopButton.disabled = true;
+    const exportCropButton = document.getElementById('export-face-crop');
+    if (exportCropButton) exportCropButton.disabled = true;
 
-    if (detectionImageUrl) {
-        URL.revokeObjectURL(detectionImageUrl);
-        detectionImageUrl = null;
-    }
-    const detectedFrame = document.getElementById('detected-frame');
-    if (detectedFrame) {
-        detectedFrame.removeAttribute('src');
-        detectedFrame.hidden = true;
-    }
-    const resultPlaceholder = document.getElementById('result-placeholder');
-    if (resultPlaceholder) resultPlaceholder.hidden = false;
+    clearDetectionCanvases();
 
     if (showStatus) setDetectorStatus('Camera stopped. Select Start Camera when you are ready.');
 }
@@ -252,146 +304,289 @@ function cameraErrorMessage(error) {
     return 'Could not start the camera. Check your browser and camera settings, then try again.';
 }
 
-function captureFrame(video) {
-    const scale = Math.min(1, MAX_FRAME_WIDTH / video.videoWidth);
-    captureCanvas.width = Math.round(video.videoWidth * scale);
-    captureCanvas.height = Math.round(video.videoHeight * scale);
-    captureContext.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-    return new Promise(resolve => captureCanvas.toBlob(resolve, 'image/jpeg', 0.65));
+function drawDetectionOverlay(canvas, width, height, faces) {
+    if (!canvas) return;
+    if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+    }
+    const context = canvas.getContext('2d');
+    context.clearRect(0, 0, width, height);
+    context.font = `bold ${Math.max(14, Math.round(width / 34))}px sans-serif`;
+    context.textBaseline = 'top';
+
+    for (const face of faces) {
+        const color = face.mask ? '#22c55e' : '#ef4444';
+        const box = face.boundingBox;
+        context.strokeStyle = color;
+        context.lineWidth = Math.max(2, width / 240);
+        context.strokeRect(box.originX, box.originY, box.width, box.height);
+
+        const label = `${face.label} ${face.confidence.toFixed(1)}%`;
+        const textWidth = context.measureText(label).width;
+        const labelY = Math.max(0, box.originY - Math.max(22, width / 22));
+        context.fillStyle = color;
+        context.fillRect(box.originX, labelY, textWidth + 10, Math.max(22, width / 22));
+        context.fillStyle = '#ffffff';
+        context.fillText(label, box.originX + 5, labelY + 3);
+    }
 }
 
-async function detectFrames(session) {
-    if (session !== detectionSession || !mediaStream) return;
-    if (detectionInFlight) {
-        if (session !== detectionInFlightSession) {
-            detectionTimer = window.setTimeout(
-                () => detectFrames(session),
-                CAMERA_READY_CHECK_INTERVAL_MS
-            );
-        }
+function renderInferenceResult(result) {
+    const {
+        width,
+        height,
+        faces,
+        resultFrame,
+        elapsedMs,
+        detectedFaceCount,
+        classifiedFaceCount,
+        detectionMs,
+        cropResizeMs,
+        pixelReadMs,
+        normalizationMs,
+        tensorCreationMs,
+        graphExecutionMs,
+        outputReadMs,
+        tensorDisposalMs,
+        classificationMs,
+        tensorCount,
+        tensorBytes
+    } = result;
+    const overlay = document.getElementById('detection-overlay');
+    const detectedFrame = document.getElementById('detected-frame');
+    const placeholder = document.getElementById('result-placeholder');
+    if (!overlay || !detectedFrame || !resultFrame) {
+        if (resultFrame) resultFrame.close();
         return;
     }
 
-    const preview = document.getElementById('camera-preview');
-    if (!preview || preview.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        detectionTimer = window.setTimeout(
-            () => detectFrames(session),
-            CAMERA_READY_CHECK_INTERVAL_MS
-        );
+    drawDetectionOverlay(overlay, width, height, faces);
+    if (detectedFrame.width !== width || detectedFrame.height !== height) {
+        detectedFrame.width = width;
+        detectedFrame.height = height;
+    }
+    const context = detectedFrame.getContext('2d');
+    context.drawImage(resultFrame, 0, 0, width, height);
+    resultFrame.close();
+    detectedFrame.hidden = false;
+    if (placeholder) placeholder.hidden = true;
+
+    const detectedAt = new Date();
+    const lastDetectionTime = document.getElementById('last-detection-time');
+    if (lastDetectionTime) {
+        lastDetectionTime.textContent = `Last local inference: ${detectedAt.toLocaleTimeString()} (${elapsedMs.toFixed(0)} ms)`;
+    }
+    updateInferenceDiagnostics({
+        detectedFaceCount,
+        classifiedFaceCount,
+        faces,
+        detectionMs,
+        cropResizeMs,
+        pixelReadMs,
+        normalizationMs,
+        tensorCreationMs,
+        graphExecutionMs,
+        outputReadMs,
+        tensorDisposalMs,
+        classificationMs,
+        elapsedMs,
+        tensorCount,
+        tensorBytes
+    });
+    const summary = faces.length === 0
+        ? 'No faces detected. Processing remains on this device.'
+        : `Locally classified ${faces.length} face${faces.length === 1 ? '' : 's'} in ${elapsedMs.toFixed(0)} ms.`;
+    setDetectorStatus(summary, true);
+}
+
+function updateInferenceDiagnostics(metrics) {
+    const completionTime = performance.now();
+    inferenceCompletionTimes.push(completionTime);
+    inferenceCompletionTimes = inferenceCompletionTimes.filter(
+        time => completionTime - time <= 5000
+    );
+    const firstCompletion = inferenceCompletionTimes[0];
+    const completionInterval = completionTime - firstCompletion;
+    const processingFps = inferenceCompletionTimes.length > 1
+        ? (inferenceCompletionTimes.length - 1) * 1000 / completionInterval
+        : 0;
+    const diagnosticValues = {
+        'diagnostic-face-count': `${metrics.detectedFaceCount} / ${metrics.classifiedFaceCount}`,
+        'diagnostic-face-boxes': metrics.faces.length
+            ? metrics.faces.map(({ boundingBox }) => {
+                const { originX, originY, width, height } = boundingBox;
+                return `${originX}, ${originY}, ${width}, ${height}`;
+            }).join('; ')
+            : 'None',
+        'diagnostic-detection-ms': `${metrics.detectionMs.toFixed(1)} ms`,
+        'diagnostic-crop-resize-ms': `${metrics.cropResizeMs.toFixed(1)} ms`,
+        'diagnostic-pixel-read-ms': `${metrics.pixelReadMs.toFixed(1)} ms`,
+        'diagnostic-normalize-ms': `${metrics.normalizationMs.toFixed(1)} ms`,
+        'diagnostic-tensor-create-ms': `${metrics.tensorCreationMs.toFixed(1)} ms`,
+        'diagnostic-graph-ms': `${metrics.graphExecutionMs.toFixed(1)} ms`,
+        'diagnostic-output-ms': `${metrics.outputReadMs.toFixed(1)} ms`,
+        'diagnostic-dispose-ms': `${metrics.tensorDisposalMs.toFixed(1)} ms`,
+        'diagnostic-classifier-ms': `${metrics.classificationMs.toFixed(1)} ms`,
+        'diagnostic-frame-ms': `${metrics.elapsedMs.toFixed(1)} ms`,
+        'diagnostic-fps': `${processingFps.toFixed(1)} FPS`,
+        'diagnostic-tensor-memory': `${metrics.tensorCount} / ${metrics.tensorBytes}`,
+    };
+    for (const [id, value] of Object.entries(diagnosticValues)) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    }
+}
+
+function setModelInitializationDiagnostic(backend, initializationMs) {
+    const element = document.getElementById('diagnostic-backend');
+    if (element) element.textContent = `${backend} / ${initializationMs.toFixed(1)} ms`;
+}
+
+function exportDiagnosticFaceCrop() {
+    if (!diagnosticCropFixture) return;
+    const { width, height, data } = diagnosticCropFixture;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    if (!context) {
+        setDetectorStatus('Could not export the local face-crop fixture.', true);
         return;
     }
 
-    detectionInFlight = true;
-    detectionInFlightSession = session;
-    let requestController = null;
-    let retryDelay = DETECTION_INTERVAL_MS;
-    let stopRetrying = false;
-    try {
-        const frame = await captureFrame(preview);
-        if (!frame) throw new Error('Could not capture a camera frame.');
-
-        setDetectorStatus(
-            detectionImageUrl
-                ? 'Processing a new frame; showing the previous successful result.'
-                : 'Processing the first frame...',
-            true
-        );
-        const formData = new FormData();
-        formData.append('image', frame, 'frame.jpg');
-        requestController = new AbortController();
-        detectionAbortController = requestController;
-        const response = await fetch('/api/detect', {
-            method: 'POST',
-            body: formData,
-            signal: requestController.signal
-        });
-
-        if (!response.ok) {
-            const result = await response.json().catch(() => ({}));
-            const error = new Error(result.error || `Detection request failed (${response.status}).`);
-            stopRetrying = response.status !== 429;
-            throw error;
-        }
-
-        const contentType = response.headers.get('Content-Type') || '';
-        if (!contentType.toLowerCase().startsWith('image/jpeg')) {
-            stopRetrying = true;
-            throw new Error('Detection service returned an unexpected image format.');
-        }
-
-        const resultBlob = await response.blob();
-        if (!resultBlob.size) {
-            stopRetrying = true;
-            throw new Error('Detection service returned an empty image.');
-        }
-        if (session !== detectionSession) return;
-
-        const detectedFrame = document.getElementById('detected-frame');
-        const resultPlaceholder = document.getElementById('result-placeholder');
-        if (!detectedFrame) {
-            stopRetrying = true;
-            throw new Error('Detection result panel is unavailable.');
-        }
-
-        const nextImageUrl = URL.createObjectURL(resultBlob);
-        const decodedImage = new Image();
-        decodedImage.src = nextImageUrl;
-        try {
-            await decodedImage.decode();
-        } catch (_error) {
-            URL.revokeObjectURL(nextImageUrl);
-            stopRetrying = true;
-            throw new Error('Detection service returned an invalid JPEG image.');
-        }
-        if (session !== detectionSession) {
-            URL.revokeObjectURL(nextImageUrl);
+    const imageData = context.createImageData(width, height);
+    for (let source = 0, target = 0; source < data.length; source += 3) {
+        imageData.data[target++] = data[source];
+        imageData.data[target++] = data[source + 1];
+        imageData.data[target++] = data[source + 2];
+        imageData.data[target++] = 255;
+    }
+    context.putImageData(imageData, 0, 0);
+    canvas.toBlob(blob => {
+        if (!blob) {
+            setDetectorStatus('Could not encode the local face-crop fixture.', true);
             return;
         }
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'maskguard-face-crop-224.png';
+        link.click();
+        URL.revokeObjectURL(url);
+    }, 'image/png');
+}
 
-        const previousImageUrl = detectionImageUrl;
-        detectedFrame.src = nextImageUrl;
-        detectedFrame.hidden = false;
-        detectionImageUrl = nextImageUrl;
-        if (resultPlaceholder) resultPlaceholder.hidden = true;
-        if (previousImageUrl) URL.revokeObjectURL(previousImageUrl);
-        detectionRetryCount = 0;
-        const detectedAt = new Date();
-        const lastDetectionTime = document.getElementById('last-detection-time');
-        if (lastDetectionTime) {
-            lastDetectionTime.textContent = `Last detection: ${detectedAt.toLocaleTimeString()}`;
+function startInferenceWorker(session) {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker('/static/browser_inference_worker.js');
+        inferenceWorker = worker;
+        let initialized = false;
+        const initializationTimeout = window.setTimeout(() => {
+            reject(new Error('Browser inference initialization timed out.'));
+        }, 90000);
+
+        inferenceWorkerReadyReject = error => {
+            window.clearTimeout(initializationTimeout);
+            reject(error);
+        };
+        worker.onmessage = event => {
+            const message = event.data || {};
+            if (session !== detectionSession) {
+                if (message.resultFrame) message.resultFrame.close();
+                return;
+            }
+            if (message.type === 'ready') {
+                initialized = true;
+                window.clearTimeout(initializationTimeout);
+                inferenceWorkerReadyReject = null;
+                setModelInitializationDiagnostic(message.backend, message.initializationMs);
+                resolve(message);
+                return;
+            }
+            if (message.type === 'frame') {
+                inferenceInFlight = false;
+                if (message.cropFixture) {
+                    diagnosticCropFixture = message.cropFixture;
+                    const exportCropButton = document.getElementById('export-face-crop');
+                    if (exportCropButton) exportCropButton.disabled = false;
+                }
+                renderInferenceResult(message);
+                return;
+            }
+            if (message.type === 'error') {
+                inferenceInFlight = false;
+                inferenceFailed = true;
+                stopInferenceLoop();
+                setDetectorStatus(`Local inference failed: ${message.message} Frames are not being sent to the server.`, true);
+                if (!initialized) {
+                    window.clearTimeout(initializationTimeout);
+                    inferenceWorkerReadyReject = null;
+                    reject(new Error(message.message));
+                }
+            }
+        };
+        worker.onerror = () => {
+            inferenceInFlight = false;
+            inferenceFailed = true;
+            stopInferenceLoop();
+            const error = new Error('Could not start the local inference worker. No frames were sent to the server.');
+            if (!initialized) {
+                window.clearTimeout(initializationTimeout);
+                inferenceWorkerReadyReject = null;
+                reject(error);
+            } else {
+                setDetectorStatus(error.message, true);
+            }
+        };
+        worker.postMessage({
+            type: 'initialize',
+            maskProbabilityMeansMask: MODEL_OUTPUT_MEANS_MASK,
+            includeDiagnosticOutputs: DEVELOPMENT_DIAGNOSTICS_ENABLED,
+            captureFirstFaceCrop: CAPTURE_FIRST_FACE_CROP
+        });
+    });
+}
+
+async function dispatchVideoFrame(session, video, timestamp) {
+    if (session !== detectionSession || !inferenceWorker || inferenceFailed || inferenceInFlight) return;
+    inferenceInFlight = true;
+    try {
+        const frame = await createImageBitmap(video);
+        if (session !== detectionSession || !inferenceWorker || inferenceFailed) {
+            frame.close();
+            inferenceInFlight = false;
+            return;
         }
-        setDetectorStatus(
-            `Detection updated at ${detectedAt.toLocaleTimeString()}.`,
-            true
+        inferenceWorker.postMessage(
+            { type: 'frame', frame, timestamp },
+            [frame]
         );
     } catch (error) {
-        if (error.name === 'AbortError' || session !== detectionSession) return;
-        detectionRetryCount += 1;
-        if (stopRetrying || detectionRetryCount >= MAX_DETECTION_RETRIES) {
-            setDetectorStatus(
-                `Detection stopped: ${error.message} Stop and restart the camera to try again.`,
-                true
-            );
-            stopRetrying = true;
-        } else {
-            setDetectorStatus(
-                `Detection service error: ${error.message} Retrying (${detectionRetryCount}/${MAX_DETECTION_RETRIES})...`,
-                true
-            );
-            retryDelay = Math.min(
-                DETECTION_INTERVAL_MS * (2 ** (detectionRetryCount - 1)),
-                MAX_DETECTION_INTERVAL_MS
-            );
-        }
-    } finally {
-        if (detectionAbortController === requestController) detectionAbortController = null;
-        detectionInFlight = false;
-        detectionInFlightSession = null;
+        inferenceInFlight = false;
+        inferenceFailed = true;
+        stopInferenceLoop();
+        setDetectorStatus(`Could not capture a local video frame: ${error.message}`, true);
     }
+}
 
-    if (!stopRetrying && session === detectionSession && mediaStream) {
-        detectionTimer = window.setTimeout(() => detectFrames(session), retryDelay);
-    }
+function startInferenceLoop(session) {
+    const preview = document.getElementById('camera-preview');
+    const scheduleNext = () => {
+        if (session !== detectionSession || !mediaStream || inferenceFailed) return;
+        if (typeof preview.requestVideoFrameCallback === 'function') {
+            inferenceFrameCallbackId = preview.requestVideoFrameCallback((now, metadata) => {
+                dispatchVideoFrame(session, preview, metadata.mediaTime * 1000);
+                scheduleNext();
+            });
+        } else {
+            detectionTimer = window.setTimeout(() => {
+                dispatchVideoFrame(session, preview, performance.now());
+                scheduleNext();
+            }, CAMERA_READY_CHECK_INTERVAL_MS);
+        }
+    };
+    scheduleNext();
 }
 
 async function startCamera() {
@@ -407,6 +602,7 @@ async function startCamera() {
     setDetectorStatus('Requesting camera permission...');
 
     const session = ++detectionSession;
+    inferenceCompletionTimes = [];
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
             video: {
@@ -426,18 +622,31 @@ async function startCamera() {
         const preview = document.getElementById('camera-preview');
         preview.srcObject = stream;
         await preview.play();
+        if (session !== detectionSession) return;
         const cameraPlaceholder = document.getElementById('camera-placeholder');
         if (cameraPlaceholder) cameraPlaceholder.hidden = true;
-        detectionRetryCount = 0;
         if (stopButton) stopButton.disabled = false;
-        setDetectorStatus('Camera active. Waiting for the first detection...', true);
-        detectFrames(session);
+        setDetectorStatus('Camera is active. Loading local face detector and classifier...', true);
+        await startInferenceWorker(session);
+        if (session !== detectionSession || !mediaStream) return;
+        setDetectorStatus('Local models ready. Frames remain on this device; classifier labels are provisional.', true);
+        startInferenceLoop(session);
     } catch (error) {
         if (session !== detectionSession) return;
         stopCamera(false);
-        if (startButton) startButton.disabled = false;
-        if (stopButton) stopButton.disabled = true;
-        setDetectorStatus(cameraErrorMessage(error));
+        const cameraErrors = [
+            'NotAllowedError',
+            'SecurityError',
+            'NotFoundError',
+            'DevicesNotFoundError',
+            'NotReadableError',
+            'TrackStartError'
+        ];
+        if (cameraErrors.includes(error.name)) {
+            setDetectorStatus(cameraErrorMessage(error));
+        } else {
+            setDetectorStatus(`Could not start local detection: ${error.message} No camera frames were sent to the server.`);
+        }
     }
 }
 
@@ -453,6 +662,15 @@ function navigateTo(pageId) {
 
     // Update Content
     contentDiv.innerHTML = pages[pageId];
+
+    const diagnostics = document.getElementById('inference-diagnostics');
+    if (diagnostics) diagnostics.hidden = !DEVELOPMENT_DIAGNOSTICS_ENABLED;
+    const exportCropButton = document.getElementById('export-face-crop');
+    if (exportCropButton) {
+        exportCropButton.hidden = !CAPTURE_FIRST_FACE_CROP;
+        exportCropButton.disabled = true;
+        exportCropButton.addEventListener('click', exportDiagnosticFaceCrop);
+    }
 
     const startButton = document.getElementById('start-camera');
     const stopButton = document.getElementById('stop-camera');
